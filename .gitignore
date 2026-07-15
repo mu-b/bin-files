@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# editor cruft
+*.swp
+*~
+
+# Claude Code skills lockfile (not part of this repo)
+skills-lock.json

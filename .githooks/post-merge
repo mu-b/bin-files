@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#
+# post-merge - refresh ~/bin symlinks after a pull/merge brings in new scripts.
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -n "$root" && -x "$root/install.sh" ]] || exit 0
+
+"$root/install.sh" >/dev/null || echo "post-merge: install.sh failed" >&2

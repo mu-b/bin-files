@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# commit-msg - enforce Conventional Commits on the subject line.
+#
+#   <type>[optional scope][!]: <description>
+#
+# e.g.  feat: add py-venv activate command
+#       fix(install): don't clobber real files in ~/bin
+#       refactor!: drop bash 3.2 support
+
+set -euo pipefail
+
+msg_file="$1"
+
+# first non-comment, non-blank line is the subject
+subject="$(grep -vE '^\s*#' "$msg_file" | grep -vE '^\s*$' | head -n1 || true)"
+
+# let git's own auto-generated messages through untouched
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+pattern="^(${types})(\([a-z0-9._/-]+\))?!?: .+"
+
+if [[ "$subject" =~ $pattern ]]; then
+    exit 0
+fi
+
+cat >&2 <<EOF
+commit-msg: message does not follow Conventional Commits.
+
+  offending subject: ${subject:-<empty>}
+
+  expected: <type>[optional scope][!]: <description>
+  types:    ${types//|/, }
+
+  examples:
+    feat: add new script
+    fix(install): skip files that are not symlinks
+    docs: explain PATH setup in README
+EOF
+exit 1
