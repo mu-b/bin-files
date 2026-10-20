@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Detect installed AI agent CLIs and update each one.
+# Usage: update-agents [-n]   (-n = dry run, print commands only)
+
+set -uo pipefail
+
+DRY=0
+[ "${1:-}" = "-n" ] && DRY=1
+
+# Agents with a native self-update subcommand: "binary:update command"
+NATIVE=(
+  "claude:claude update"
+  "omp:omp update"
+  "opencode:opencode upgrade"
+  "muse:muse update"
+  "goose:goose update"
+  "amp:amp update"
+  "droid:droid update"
+)
+
+# Agents without one; updated via their package manager: "binary:brew-name"
+# (npm-global installs are detected from the binary's real path instead)
+PKG=(
+  "pi:"
+  "gemini:"
+  "codex:codex"
+  "copilot:copilot-cli"
+  "crush:crush"
+  "qwen:"
+  "aider:"
+  "cursor-agent:"
+)
+
+OK=(); FAIL=(); SKIP=()
+
+run() {
+  local name=$1; shift
+  echo "==> $name: $*"
+  if [ "$DRY" = 1 ]; then OK+=("$name"); return; fi
+  if "$@"; then OK+=("$name"); else FAIL+=("$name"); fi
+}
+
+# Update via whichever package manager owns the binary.
+update_pkg() {
+  local bin=$1 brewname=$2 path real pkg
+  path=$(command -v "$bin") || return 1
+  real=$(readlink -f "$path" 2>/dev/null || echo "$path")
+
+  if [[ $real == */node_modules/* ]]; then
+    # .../node_modules/@scope/name/... or .../node_modules/name/...
+    pkg=${real#*node_modules/}
+    if [[ $pkg == @* ]]; then pkg=${pkg%%/*}/$(echo "${pkg#*/}" | cut -d/ -f1); else pkg=${pkg%%/*}; fi
+    run "$bin" npm install -g "$pkg@latest"
+  elif [[ $real == */Caskroom/* && -n $brewname ]]; then
+    run "$bin" brew upgrade --cask "$brewname"
+  elif [[ $real == */Cellar/* && -n $brewname ]]; then
+    run "$bin" brew upgrade "$brewname"
+  elif [[ $real == */uv/tools/* ]] && command -v uv >/dev/null; then
+    run "$bin" uv tool upgrade "$(echo "${real#*uv/tools/}" | cut -d/ -f1)"
+  elif [[ $real == */pipx/venvs/* ]] && command -v pipx >/dev/null; then
+    run "$bin" pipx upgrade "$(echo "${real#*pipx/venvs/}" | cut -d/ -f1)"
+  else
+    echo "==> $bin: unknown install method ($real), skipped"
+    SKIP+=("$bin")
+  fi
+}
+
+for entry in "${NATIVE[@]}"; do
+  bin=${entry%%:*}; cmd=${entry#*:}
+  command -v "$bin" >/dev/null 2>&1 || continue
+  # shellcheck disable=SC2086
+  run "$bin" $cmd
+done
+
+for entry in "${PKG[@]}"; do
+  bin=${entry%%:*}; brewname=${entry#*:}
+  command -v "$bin" >/dev/null 2>&1 || continue
+  update_pkg "$bin" "$brewname"
+done
+
+echo
+echo "updated: ${OK[*]:-none}"
+[ ${#SKIP[@]} -gt 0 ] && echo "skipped: ${SKIP[*]}"
+[ ${#FAIL[@]} -gt 0 ] && { echo "failed:  ${FAIL[*]}"; exit 1; }
+exit 0
