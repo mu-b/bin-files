@@ -3,40 +3,73 @@
 # py-venv - manage per-python-version virtualenvs in $HOME
 #
 #   py-venv create            build a .venv-pythonNN for every Homebrew python3.NN
-#   py-venv activate <ver>    deactivate current venv (if any) and activate <ver>
+#   py-venv activate [<ver>]  deactivate current venv (if any) and activate <ver>;
+#                             no <ver> activates the ~/.venv default
 #   py-venv set <ver>         point ~/.venv symlink at the <ver> venv
+#   py-venv list              show the venvs and which one ~/.venv points at
 #
-# <ver> may be given as "3.11" or "11".
+# <ver> may be given as "3.11", "11" or "python3.11".
 #
 # NOTE: `activate` changes your current shell, so it must be *sourced*:
 #         source py-venv activate 3.11
 #       Add this to your shell rc to make that painless:
 #         py-venv() { if [[ $1 == activate ]]; then source "$HOME/bin/py-venv" "$@"; else command "$HOME/bin/py-venv" "$@"; fi; }
+#
+# Python install dir defaults to the first existing of /opt/homebrew/bin,
+# /usr/local/bin, /home/linuxbrew/.linuxbrew/bin; override with PY_VENV_BIN.
 
-BREW_BIN="/opt/homebrew/bin"
+# Helpers carry a _pv_ prefix: when sourced they land in the caller's shell.
 
-# minor-version number from a "3.11" / "11" / "python11" style argument
-_minor() {
-    local v="${1#3.}"   # strip a leading "3."
-    v="${v#python}"     # tolerate "python11"
+_pv_err() { echo "py-venv: $*" >&2; }
+
+_pv_bin() {
+    local d
+    if [[ -n "${PY_VENV_BIN:-}" ]]; then
+        printf '%s' "$PY_VENV_BIN"
+        return
+    fi
+    for d in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin; do
+        if compgen -G "$d/python3.[0-9]*" >/dev/null; then
+            printf '%s' "$d"
+            return
+        fi
+    done
+    printf '/opt/homebrew/bin'
+}
+
+# minor-version number from a "3.11" / "11" / "python3.11" style argument
+_pv_minor() {
+    local v="${1#python}"   # tolerate "python3.11" / "python11"
+    v="${v#3.}"             # strip a leading "3."
     if [[ ! "$v" =~ ^[0-9]+$ ]]; then
-        echo "py-venv: invalid version '$1' (expected e.g. 3.11 or 11)" >&2
+        _pv_err "invalid version '$1' (expected e.g. 3.11 or 11)"
         return 1
     fi
     printf '%s' "$v"
 }
 
-_venv_dir() { printf '%s/.venv-python%s' "$HOME" "$1"; }
+_pv_dir() { printf '%s/.venv-python%s' "$HOME" "$1"; }
 
-cmd_create() {
-    local found=0 py base minor dir
-    for py in "$BREW_BIN"/python3.[0-9] "$BREW_BIN"/python3.[0-9][0-9]; do
+# Directory for an optional version arg; empty arg means the ~/.venv default.
+_pv_resolve() {
+    local minor
+    if [[ -z "${1:-}" ]]; then
+        printf '%s/.venv' "$HOME"
+        return
+    fi
+    minor="$(_pv_minor "$1")" || return 1
+    _pv_dir "$minor"
+}
+
+_pv_create() {
+    local found=0 py minor dir bin
+    bin="$(_pv_bin)"
+    for py in "$bin"/python3.*; do
         [[ -x "$py" ]] || continue
-        base="$(basename "$py")"          # python3.11
-        minor="${base#python3.}"          # 11
+        minor="${py##*/python3.}"          # python3.11 -> 11 (skips python3.11-config)
         [[ "$minor" =~ ^[0-9]+$ ]] || continue
         found=1
-        dir="$(_venv_dir "$minor")"
+        dir="$(_pv_dir "$minor")"
         if [[ -d "$dir" ]]; then
             echo "skip:   $dir (already exists)"
             continue
@@ -44,15 +77,14 @@ cmd_create() {
         echo "create: $dir  (using $py)"
         "$py" -m venv "$dir" || return 1
     done
-    [[ "$found" -eq 1 ]] || { echo "py-venv: no python3.NN found in $BREW_BIN" >&2; return 1; }
+    [[ "$found" -eq 1 ]] || { _pv_err "no python3.NN found in $bin"; return 1; }
 }
 
-cmd_activate() {
-    local minor dir
-    minor="$(_minor "${1:-}")" || return 1
-    dir="$(_venv_dir "$minor")"
+_pv_activate() {
+    local dir
+    dir="$(_pv_resolve "${1:-}")" || return 1
     if [[ ! -f "$dir/bin/activate" ]]; then
-        echo "py-venv: $dir not found (run: py-venv create)" >&2
+        _pv_err "$dir not found (run: py-venv create)"
         return 1
     fi
     # deactivate whatever is currently active
@@ -64,45 +96,65 @@ cmd_activate() {
     echo "activated: $dir"
 }
 
-cmd_set() {
-    local minor dir
-    minor="$(_minor "${1:-}")" || return 1
-    dir="$(_venv_dir "$minor")"
+_pv_set() {
+    local dir link="$HOME/.venv"
+    if [[ -z "${1:-}" ]]; then
+        _pv_err "usage: py-venv set <ver>"
+        return 2
+    fi
+    dir="$(_pv_resolve "$1")" || return 1
     if [[ ! -d "$dir" ]]; then
-        echo "py-venv: $dir not found (run: py-venv create)" >&2
+        _pv_err "$dir not found (run: py-venv create)"
         return 1
     fi
-    ln -sfn "$dir" "$HOME/.venv"
-    echo "set: $HOME/.venv -> $dir"
+    # ln -sfn onto a real directory would drop the link *inside* it
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        _pv_err "$link exists and is not a symlink; move it aside first"
+        return 1
+    fi
+    ln -sfn "$dir" "$link"
+    echo "set: $link -> $dir"
 }
 
-py_venv_main() {
+_pv_list() {
+    local cur="" d
+    if [[ -L "$HOME/.venv" ]]; then
+        cur="$(readlink "$HOME/.venv")"
+        cur="${cur%/}"
+        [[ "$cur" == /* ]] || cur="$HOME/$cur"
+    fi
+    for d in "$HOME"/.venv-python*; do
+        [[ -f "$d/bin/activate" ]] || continue
+        if [[ "$d" == "$cur" ]]; then
+            echo "* $d"
+        else
+            echo "  $d"
+        fi
+    done
+}
+
+_pv_main() {
     local sub="${1:-}"
-    [[ "$#" -gt 0 ]] && shift
+    shift || true
     case "$sub" in
-        create)   cmd_create "$@" ;;
-        activate) cmd_activate "$@" ;;
-        set)      cmd_set "$@" ;;
-        *)        echo "usage: py-venv {create | activate <ver> | set <ver>}" >&2; return 2 ;;
+        create)   _pv_create "$@" ;;
+        activate) _pv_activate "$@" ;;
+        set)      _pv_set "$@" ;;
+        list)     _pv_list "$@" ;;
+        *)        echo "usage: py-venv {create | activate [<ver>] | set <ver> | list}" >&2; return 2 ;;
     esac
 }
 
-# Are we being sourced? (activate needs to run in the caller's shell)
-_pv_sourced=0
-if [[ -n "${BASH_SOURCE:-}" && "${BASH_SOURCE[0]}" != "${0}" ]]; then
-    _pv_sourced=1
-fi
-
-if [[ "$_pv_sourced" -eq 1 ]]; then
+if (return 0 2>/dev/null); then
     # Sourced: do NOT touch the caller's shell options or exit it.
-    py_venv_main "$@"
+    _pv_main "$@"
 else
     # Executed directly.
     set -euo pipefail
     if [[ "${1:-}" == "activate" ]]; then
-        echo "py-venv: 'activate' must be sourced to affect your shell:" >&2
-        echo "         source \"$HOME/bin/py-venv\" activate ${2:-<ver>}" >&2
+        _pv_err "'activate' must be sourced to affect your shell:"
+        echo "         source \"$HOME/bin/py-venv\" activate ${2:-[<ver>]}" >&2
         exit 1
     fi
-    py_venv_main "$@"
+    _pv_main "$@"
 fi

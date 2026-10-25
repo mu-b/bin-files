@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Carve HTTP request/response pairs out of a Burp project file (.burp).
+
+The .burp format is proprietary and undocumented, so this does not parse the
+database. It scans the raw bytes for HTTP/1.x requests and the responses
+stored directly after them. Burp stores each message with a 4-byte
+big-endian length prefix, which gives exact message boundaries; if the prefix
+does not validate, Content-Length / chunked framing is used instead.
+
+Usage: burp_extract.py <file.burp> <output_dir> [--no-dedupe]
+
+Writes per pair (raw bytes, bodies untouched):
+    NNNN_METHOD_host_path.req
+    NNNN_METHOD_host_path.resp   (omitted when no response was stored)
+"""
+import argparse
+import hashlib
+import re
+import struct
+import sys
+from pathlib import Path
+
+REQ_RE = re.compile(
+    rb"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE) \S+ HTTP/1\.[01]\r\n"
+)
+RES_RE = re.compile(rb"HTTP/1\.[01] \d{3}[^\r\n]*\r\n")
+# Max gap between end of a request and the start of its response (framing bytes).
+RESP_GAP = 48
+
+
+def header_end(data, start, limit):
+    i = data.find(b"\r\n\r\n", start, limit)
+    return -1 if i < 0 else i + 4
+
+
+def headers_of(raw):
+    out = {}
+    for line in raw.split(b"\r\n")[1:]:
+        k, sep, v = line.partition(b":")
+        if sep:
+            out.setdefault(k.strip().lower(), v.strip())
+    return out
+
+
+def chunked_end(data, pos, limit):
+    """Offset just past a chunked body starting at pos, or -1 if malformed."""
+    while pos < limit:
+        eol = data.find(b"\r\n", pos, limit)
+        if eol < 0:
+            return -1
+        try:
+            size = int(data[pos:eol].split(b";")[0], 16)
+        except ValueError:
+            return -1
+        pos = eol + 2
+        if size == 0:
+            end = data.find(b"\r\n\r\n", pos - 2, limit)  # trailers
+            return -1 if end < 0 else end + 4
+        pos += size + 2
+    return -1
+
+
+def message_end(data, start, limit, is_response):
+    """Return end offset of the HTTP message starting at `start`."""
+    he = header_end(data, start, limit)
+    if he < 0:
+        return -1
+    # Burp's own length prefix, if it checks out.
+    if start >= 4:
+        n = struct.unpack(">I", data[start - 4 : start])[0]
+        if he - start <= n and start + n <= limit:
+            return start + n
+    h = headers_of(data[start:he])
+    if b"chunked" in h.get(b"transfer-encoding", b"").lower():
+        return chunked_end(data, he, limit)
+    cl = h.get(b"content-length")
+    if cl and cl.isdigit() and he + int(cl) <= limit:
+        return he + int(cl)
+    if not is_response or start >= limit:
+        return he  # request without body
+    return -1
+
+
+def slug(s, maxlen=60):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")[:maxlen] or "root"
+
+
+def carve(data):
+    """Yield (request_bytes, response_bytes_or_None) in file order."""
+    pos = 0
+    n = len(data)
+    while True:
+        m = REQ_RE.search(data, pos)
+        if not m:
+            return
+        s = m.start()
+        # Skip matches that are really just text inside a body.
+        if header_end(data, s, min(n, s + 65536)) < 0:
+            pos = m.end()
+            continue
+        req_end = message_end(data, s, n, False)
+        if req_end < 0:
+            pos = m.end()
+            continue
+        req = data[s:req_end]
+        resp = None
+        rm = RES_RE.search(data, req_end, min(n, req_end + RESP_GAP))
+        if rm:
+            rs = rm.start()
+            resp_end = message_end(data, rs, n, True)
+            if resp_end > 0:
+                resp = data[rs:resp_end]
+                req_end = resp_end
+        pos = req_end
+        yield req, resp
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("burp_file")
+    ap.add_argument("out_dir")
+    ap.add_argument("--no-dedupe", action="store_true",
+                    help="keep byte-identical request/response pairs")
+    args = ap.parse_args()
+
+    data = Path(args.burp_file).read_bytes()
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    items = list(carve(data))
+    # Burp keeps extra response-less copies of requests; drop those when the
+    # same request is also stored with its response.
+    paired = {req for req, resp in items if resp is not None}
+
+    seen = set()
+    count = with_resp = dupes = 0
+    for req, resp in items:
+        if not args.no_dedupe:
+            if resp is None and req in paired:
+                dupes += 1
+                continue
+            key = hashlib.sha256(req + b"\0\0\0" + (resp or b"")).digest()
+            if key in seen:
+                dupes += 1
+                continue
+            seen.add(key)
+        first = req.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
+        method, target = first[0], first[1]
+        host = headers_of(req).get(b"host", b"nohost").decode("latin-1")
+        path = target.split("?", 1)[0]
+        count += 1
+        name = f"{count:04d}_{method}_{slug(host)}_{slug(path)}"
+        (out / f"{name}.req").write_bytes(req)
+        if resp is not None:
+            (out / f"{name}.resp").write_bytes(resp)
+            with_resp += 1
+
+    print(f"{count} requests written to {out} "
+          f"({with_resp} with responses, {dupes} duplicates skipped)")
+    return 0 if count else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
